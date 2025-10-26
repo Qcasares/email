@@ -1,0 +1,12 @@
+{
+  "smtp_server": "10.51.1.34",
+  "smtp_port": 587,
+  "from_address": "reports@alpha-bank.co.uk",
+  "to_addresses": [
+    "quentincasares@alpha-bank.co.uk"
+  ],
+  "subject": "Test Email from Python SMTP Script",
+  "body_text": "This is the plain text version of the email.\n\nIt will be displayed by email clients that don't support HTML.",
+  "body_html": "<html><body><h1>Test Email</h1><p>This is the <strong>HTML version</strong> of the email.</p><p>It supports <em>formatting</em> and <a href='https://example.com'>links</a>.</p></body></html>",
+  "attachments": []
+}
