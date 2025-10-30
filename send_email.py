@@ -7,16 +7,13 @@ Configuration is loaded from email_config.json.
 
 import smtplib
 import json
-import os
 import sys
 import ssl
 import logging
 import mimetypes
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+from email.message import EmailMessage
 from pathlib import Path
+from typing import Iterable
 
 
 def load_configuration(config_file_path):
@@ -34,11 +31,12 @@ def load_configuration(config_file_path):
         json.JSONDecodeError: If config file is invalid JSON
     """
     try:
-        with open(config_file_path, 'r') as config_file:
+        config_path = Path(config_file_path).expanduser()
+        with config_path.open('r', encoding='utf-8') as config_file:
             configuration = json.load(config_file)
         return configuration
     except FileNotFoundError:
-        logging.error("Configuration file '%s' not found.", config_file_path)
+        logging.error("Configuration file '%s' not found.", config_path)
         raise
     except json.JSONDecodeError as json_error:
         logging.error("Invalid JSON in configuration file: %s", json_error)
@@ -62,6 +60,22 @@ def _ensure_list(value):
     if isinstance(value, str):
         return [v.strip() for v in value.split(',') if v.strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _unique_preserve_order(values: Iterable[str]):
+    """Return a list with duplicates removed while preserving order (case-insensitive)."""
+    seen = set()
+    unique_values = []
+    for value in values:
+        normalized_value = str(value).strip()
+        if not normalized_value:
+            continue
+        key = normalized_value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_values.append(normalized_value)
+    return unique_values
 
 
 def validate_configuration(configuration):
@@ -95,17 +109,18 @@ def validate_configuration(configuration):
     body_text_path = configuration.get('body_text_file')
     body_html_path = configuration.get('body_html_file')
     try:
-        if body_text_path and os.path.exists(body_text_path):
-            with open(body_text_path, 'r', encoding='utf-8') as f:
-                configuration['body_text'] = f.read()
-        if body_html_path and os.path.exists(body_html_path):
-            with open(body_html_path, 'r', encoding='utf-8') as f:
-                configuration['body_html'] = f.read()
+        if body_text_path:
+            text_path = Path(body_text_path).expanduser()
+            if text_path.exists():
+                configuration['body_text'] = text_path.read_text(encoding='utf-8')
+        if body_html_path:
+            html_path = Path(body_html_path).expanduser()
+            if html_path.exists():
+                configuration['body_html'] = html_path.read_text(encoding='utf-8')
     except Exception as body_error:
         logging.error("Failed reading body file: %s", body_error)
         return False
 
-    return True
     return True
 
 
@@ -117,9 +132,9 @@ def create_email_message(configuration):
         configuration: Configuration dictionary
 
     Returns:
-        MIMEMultipart: Configured email message
+        EmailMessage: Configured email message
     """
-    email_message = MIMEMultipart('mixed')
+    email_message = EmailMessage()
     email_message['From'] = configuration['from_address']
     email_message['To'] = ', '.join(configuration['to_addresses'])
     if configuration.get('cc_addresses'):
@@ -136,20 +151,16 @@ def create_email_message(configuration):
                 continue
             email_message[header_name] = str(header_value)
 
-    # Build alternative part for text and html
-    alternative_part = MIMEMultipart('alternative')
+    plain_text_body = configuration.get('body_text')
+    html_body = configuration.get('body_html')
 
-    plain_text_body = configuration.get('body_text', '')
-    html_body = configuration.get('body_html', '')
+    email_message.set_content(
+        plain_text_body if plain_text_body else 'This is a test email.',
+        charset='utf-8',
+    )
 
-    if plain_text_body:
-        alternative_part.attach(MIMEText(plain_text_body, 'plain', _charset='utf-8'))
     if html_body:
-        alternative_part.attach(MIMEText(html_body, 'html', _charset='utf-8'))
-    if not plain_text_body and not html_body:
-        alternative_part.attach(MIMEText('This is a test email.', 'plain', _charset='utf-8'))
-
-    email_message.attach(alternative_part)
+        email_message.add_alternative(html_body, subtype='html', charset='utf-8')
 
     return email_message
 
@@ -159,7 +170,7 @@ def attach_files(email_message, attachment_file_paths):
     Attach files to the email message.
 
     Args:
-        email_message: MIMEMultipart message object
+        email_message: EmailMessage object ready for attachments
         attachment_file_paths: List of file paths to attach
 
     Returns:
@@ -169,28 +180,34 @@ def attach_files(email_message, attachment_file_paths):
 
     for attachment_file_path in attachment_file_paths:
         try:
-            if not os.path.exists(attachment_file_path):
-                print(f"Warning: Attachment file '{attachment_file_path}' not found. Skipping.")
+            attachment_path = Path(attachment_file_path).expanduser()
+            if not attachment_path.is_file():
+                logging.warning("Attachment file '%s' not found. Skipping.", attachment_file_path)
                 continue
 
-            mime_type, _ = mimetypes.guess_type(attachment_file_path)
+            mime_type, _ = mimetypes.guess_type(str(attachment_path))
             main_type, sub_type = ('application', 'octet-stream') if not mime_type else mime_type.split('/', 1)
 
-            file_name = os.path.basename(attachment_file_path)
+            file_name = attachment_path.name
 
             if main_type == 'text':
-                with open(attachment_file_path, 'r', encoding='utf-8', errors='ignore') as attachment_file:
+                with attachment_path.open('r', encoding='utf-8', errors='replace') as attachment_file:
                     file_content = attachment_file.read()
-                part = MIMEText(file_content, _subtype=sub_type, _charset='utf-8')
+                email_message.add_attachment(
+                    file_content,
+                    maintype=main_type,
+                    subtype=sub_type,
+                    filename=file_name,
+                )
             else:
-                with open(attachment_file_path, 'rb') as attachment_file:
+                with attachment_path.open('rb') as attachment_file:
                     file_content = attachment_file.read()
-                part = MIMEBase(main_type, sub_type)
-                part.set_payload(file_content)
-                encoders.encode_base64(part)
-
-            part.add_header('Content-Disposition', f'attachment; filename="{file_name}"')
-            email_message.attach(part)
+                email_message.add_attachment(
+                    file_content,
+                    maintype=main_type,
+                    subtype=sub_type,
+                    filename=file_name,
+                )
             successfully_attached_count += 1
             logging.info("Attached: %s", file_name)
 
@@ -208,7 +225,7 @@ def send_email(smtp_server_address, smtp_server_port, email_message, from_addres
     Args:
         smtp_server_address: SMTP server hostname or IP
         smtp_server_port: SMTP server port
-        email_message: MIMEMultipart message to send
+        email_message: EmailMessage to send
         from_address: Sender email address
         to_addresses: List of recipient email addresses
 
@@ -298,18 +315,24 @@ def main():
         # Create email message
         email_message = create_email_message(configuration)
 
-        # Attach files if specified
-        attachment_file_paths = configuration.get('attachments', [])
-        if attachment_file_paths:
+        # Attach files if specified (skip heavy I/O when dry-run)
+        attachment_file_paths = configuration.get('attachments') or []
+        if dry_run and attachment_file_paths:
+            logging.info(
+                "Dry-run enabled; skipping processing of %d attachment(s).",
+                len(attachment_file_paths),
+            )
+        elif attachment_file_paths:
             logging.info("Processing %d attachment(s)...", len(attachment_file_paths))
             attach_files(email_message, attachment_file_paths)
 
         # Compute all recipients including CC and BCC
-        to_addresses = list(configuration['to_addresses'])
+        recipients = list(configuration['to_addresses'])
         if configuration.get('cc_addresses'):
-            to_addresses.extend(configuration['cc_addresses'])
+            recipients.extend(configuration['cc_addresses'])
         if configuration.get('bcc_addresses'):
-            to_addresses.extend(configuration['bcc_addresses'])
+            recipients.extend(configuration['bcc_addresses'])
+        to_addresses = _unique_preserve_order(recipients)
 
         # Send email
         send_success = send_email(
