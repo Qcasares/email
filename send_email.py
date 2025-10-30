@@ -9,6 +9,9 @@ import smtplib
 import json
 import os
 import sys
+import ssl
+import logging
+import mimetypes
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -35,11 +38,30 @@ def load_configuration(config_file_path):
             configuration = json.load(config_file)
         return configuration
     except FileNotFoundError:
-        print(f"Error: Configuration file '{config_file_path}' not found.")
+        logging.error("Configuration file '%s' not found.", config_file_path)
         raise
     except json.JSONDecodeError as json_error:
-        print(f"Error: Invalid JSON in configuration file: {json_error}")
+        logging.error("Invalid JSON in configuration file: %s", json_error)
         raise
+
+
+def _ensure_list(value):
+    """
+    Normalize a value to a list of strings. Accepts list or comma-separated string.
+
+    Args:
+        value: The value to normalize
+
+    Returns:
+        list[str]: Normalized list (empty list if value is falsy)
+    """
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(',') if v.strip()]
+    return [str(value).strip()] if str(value).strip() else []
 
 
 def validate_configuration(configuration):
@@ -56,17 +78,34 @@ def validate_configuration(configuration):
 
     for required_field in required_fields:
         if required_field not in configuration:
-            print(f"Error: Missing required field '{required_field}' in configuration.")
+            logging.error("Missing required field '%s' in configuration.", required_field)
             return False
 
-    if not isinstance(configuration['to_addresses'], list):
-        print("Error: 'to_addresses' must be a list.")
+    to_list = _ensure_list(configuration.get('to_addresses'))
+    if len(to_list) == 0:
+        logging.error("'to_addresses' list cannot be empty.")
         return False
 
-    if len(configuration['to_addresses']) == 0:
-        print("Error: 'to_addresses' list cannot be empty.")
+    # Normalize lists for optional fields as well
+    configuration['to_addresses'] = to_list
+    configuration['cc_addresses'] = _ensure_list(configuration.get('cc_addresses'))
+    configuration['bcc_addresses'] = _ensure_list(configuration.get('bcc_addresses'))
+
+    # Load body from files if provided
+    body_text_path = configuration.get('body_text_file')
+    body_html_path = configuration.get('body_html_file')
+    try:
+        if body_text_path and os.path.exists(body_text_path):
+            with open(body_text_path, 'r', encoding='utf-8') as f:
+                configuration['body_text'] = f.read()
+        if body_html_path and os.path.exists(body_html_path):
+            with open(body_html_path, 'r', encoding='utf-8') as f:
+                configuration['body_html'] = f.read()
+    except Exception as body_error:
+        logging.error("Failed reading body file: %s", body_error)
         return False
 
+    return True
     return True
 
 
@@ -80,27 +119,37 @@ def create_email_message(configuration):
     Returns:
         MIMEMultipart: Configured email message
     """
-    email_message = MIMEMultipart('alternative')
+    email_message = MIMEMultipart('mixed')
     email_message['From'] = configuration['from_address']
     email_message['To'] = ', '.join(configuration['to_addresses'])
+    if configuration.get('cc_addresses'):
+        email_message['Cc'] = ', '.join(configuration['cc_addresses'])
+    if configuration.get('reply_to'):
+        email_message['Reply-To'] = configuration['reply_to']
     email_message['Subject'] = configuration['subject']
 
-    # Add plain text version
+    # Custom headers
+    custom_headers = configuration.get('headers', {})
+    if isinstance(custom_headers, dict):
+        for header_name, header_value in custom_headers.items():
+            if header_name.lower() in {'from', 'to', 'cc', 'bcc', 'subject', 'reply-to'}:
+                continue
+            email_message[header_name] = str(header_value)
+
+    # Build alternative part for text and html
+    alternative_part = MIMEMultipart('alternative')
+
     plain_text_body = configuration.get('body_text', '')
-    if plain_text_body:
-        plain_text_part = MIMEText(plain_text_body, 'plain')
-        email_message.attach(plain_text_part)
-
-    # Add HTML version
     html_body = configuration.get('body_html', '')
-    if html_body:
-        html_part = MIMEText(html_body, 'html')
-        email_message.attach(html_part)
 
-    # If neither text nor HTML is provided, use a default message
+    if plain_text_body:
+        alternative_part.attach(MIMEText(plain_text_body, 'plain', _charset='utf-8'))
+    if html_body:
+        alternative_part.attach(MIMEText(html_body, 'html', _charset='utf-8'))
     if not plain_text_body and not html_body:
-        default_message = MIMEText('This is a test email.', 'plain')
-        email_message.attach(default_message)
+        alternative_part.attach(MIMEText('This is a test email.', 'plain', _charset='utf-8'))
+
+    email_message.attach(alternative_part)
 
     return email_message
 
@@ -124,30 +173,35 @@ def attach_files(email_message, attachment_file_paths):
                 print(f"Warning: Attachment file '{attachment_file_path}' not found. Skipping.")
                 continue
 
-            with open(attachment_file_path, 'rb') as attachment_file:
-                file_content = attachment_file.read()
-
-            attachment_part = MIMEBase('application', 'octet-stream')
-            attachment_part.set_payload(file_content)
-            encoders.encode_base64(attachment_part)
+            mime_type, _ = mimetypes.guess_type(attachment_file_path)
+            main_type, sub_type = ('application', 'octet-stream') if not mime_type else mime_type.split('/', 1)
 
             file_name = os.path.basename(attachment_file_path)
-            attachment_part.add_header(
-                'Content-Disposition',
-                f'attachment; filename= {file_name}'
-            )
 
-            email_message.attach(attachment_part)
+            if main_type == 'text':
+                with open(attachment_file_path, 'r', encoding='utf-8', errors='ignore') as attachment_file:
+                    file_content = attachment_file.read()
+                part = MIMEText(file_content, _subtype=sub_type, _charset='utf-8')
+            else:
+                with open(attachment_file_path, 'rb') as attachment_file:
+                    file_content = attachment_file.read()
+                part = MIMEBase(main_type, sub_type)
+                part.set_payload(file_content)
+                encoders.encode_base64(part)
+
+            part.add_header('Content-Disposition', f'attachment; filename="{file_name}"')
+            email_message.attach(part)
             successfully_attached_count += 1
-            print(f"Attached: {file_name}")
+            logging.info("Attached: %s", file_name)
 
         except Exception as attachment_error:
-            print(f"Error attaching '{attachment_file_path}': {attachment_error}")
+            logging.error("Error attaching '%s': %s", attachment_file_path, attachment_error)
 
     return successfully_attached_count
 
 
-def send_email(smtp_server_address, smtp_server_port, email_message, from_address, to_addresses):
+def send_email(smtp_server_address, smtp_server_port, email_message, from_address, to_addresses, *,
+               use_ssl=False, use_tls=False, username=None, password=None, timeout=10, dry_run=False):
     """
     Send email via SMTP server.
 
@@ -162,29 +216,46 @@ def send_email(smtp_server_address, smtp_server_port, email_message, from_addres
         bool: True if successful, False otherwise
     """
     try:
-        print(f"Connecting to SMTP server {smtp_server_address}:{smtp_server_port}...")
+        if dry_run:
+            logging.info("Dry-run enabled. Skipping send. To: %s | Subject: %s", ', '.join(to_addresses), email_message.get('Subject'))
+            return True
 
-        smtp_connection = smtplib.SMTP(smtp_server_address, smtp_server_port, timeout=10)
+        logging.info("Connecting to SMTP server %s:%s...", smtp_server_address, smtp_server_port)
+
+        if use_ssl:
+            context = ssl.create_default_context()
+            smtp_connection = smtplib.SMTP_SSL(smtp_server_address, smtp_server_port, timeout=timeout, context=context)
+        else:
+            smtp_connection = smtplib.SMTP(smtp_server_address, smtp_server_port, timeout=timeout)
         smtp_connection.ehlo()
 
-        print("Sending email...")
+        if use_tls and not use_ssl:
+            context = ssl.create_default_context()
+            smtp_connection.starttls(context=context)
+            smtp_connection.ehlo()
+
+        if username and password:
+            logging.debug("Authenticating as %s", username)
+            smtp_connection.login(username, password)
+
+        logging.info("Sending email...")
         smtp_connection.sendmail(from_address, to_addresses, email_message.as_string())
 
         smtp_connection.quit()
-        print("Email sent successfully!")
+        logging.info("Email sent successfully!")
         return True
 
     except smtplib.SMTPException as smtp_error:
-        print(f"SMTP Error: {smtp_error}")
+        logging.error("SMTP Error: %s", smtp_error)
         return False
     except ConnectionRefusedError:
-        print(f"Error: Connection refused to {smtp_server_address}:{smtp_server_port}")
+        logging.error("Connection refused to %s:%s", smtp_server_address, smtp_server_port)
         return False
     except TimeoutError:
-        print(f"Error: Connection timeout to {smtp_server_address}:{smtp_server_port}")
+        logging.error("Connection timeout to %s:%s", smtp_server_address, smtp_server_port)
         return False
     except Exception as general_error:
-        print(f"Error sending email: {general_error}")
+        logging.error("Error sending email: %s", general_error)
         return False
 
 
@@ -202,12 +273,27 @@ def main():
         # Load and validate configuration
         configuration = load_configuration(config_file_path)
 
+        # Configure logging
+        log_level_str = str(configuration.get('log_level', 'INFO')).upper()
+        log_level = getattr(logging, log_level_str, logging.INFO)
+        logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
+
         if not validate_configuration(configuration):
             sys.exit(1)
 
         # Get SMTP settings with defaults
         smtp_server_address = configuration['smtp_server']
-        smtp_server_port = configuration.get('smtp_port', 25)
+
+        # Security and ports
+        use_ssl = bool(configuration.get('use_ssl', False))
+        use_tls = bool(configuration.get('use_tls', False))
+        if 'smtp_port' in configuration:
+            smtp_server_port = configuration.get('smtp_port')
+        else:
+            smtp_server_port = 465 if use_ssl else (587 if use_tls else 25)
+
+        timeout = int(configuration.get('timeout', 10))
+        dry_run = bool(configuration.get('dry_run', False))
 
         # Create email message
         email_message = create_email_message(configuration)
@@ -215,8 +301,15 @@ def main():
         # Attach files if specified
         attachment_file_paths = configuration.get('attachments', [])
         if attachment_file_paths:
-            print(f"Processing {len(attachment_file_paths)} attachment(s)...")
+            logging.info("Processing %d attachment(s)...", len(attachment_file_paths))
             attach_files(email_message, attachment_file_paths)
+
+        # Compute all recipients including CC and BCC
+        to_addresses = list(configuration['to_addresses'])
+        if configuration.get('cc_addresses'):
+            to_addresses.extend(configuration['cc_addresses'])
+        if configuration.get('bcc_addresses'):
+            to_addresses.extend(configuration['bcc_addresses'])
 
         # Send email
         send_success = send_email(
@@ -224,7 +317,13 @@ def main():
             smtp_server_port,
             email_message,
             configuration['from_address'],
-            configuration['to_addresses']
+            to_addresses,
+            use_ssl=use_ssl,
+            use_tls=use_tls,
+            username=configuration.get('smtp_username'),
+            password=configuration.get('smtp_password'),
+            timeout=timeout,
+            dry_run=dry_run,
         )
 
         if send_success:
@@ -233,7 +332,7 @@ def main():
             sys.exit(1)
 
     except Exception as main_error:
-        print(f"Fatal error: {main_error}")
+        logging.error("Fatal error: %s", main_error)
         sys.exit(1)
 
 
