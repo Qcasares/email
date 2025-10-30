@@ -431,6 +431,34 @@ def main():
         timeout = int(configuration.get('timeout', 10))
         dry_run = bool(configuration.get('dry_run', False))
 
+        # Auth and security options
+        auth_method = configuration.get('auth_method')
+        oauth2_provider = configuration.get('oauth2_provider')
+        oauth2 = {
+            'token_uri': configuration.get('token_uri'),
+            'client_id': configuration.get('client_id'),
+            'client_secret': configuration.get('client_secret'),
+            'refresh_token': configuration.get('refresh_token'),
+            'tenant_id': configuration.get('tenant_id'),
+            'timeout': configuration.get('timeout', 15),
+        }
+        # Remove keys with falsy values to avoid confusing downstream checks
+        oauth2 = {k: v for k, v in oauth2.items() if v}
+
+        require_tls = bool(configuration.get('require_tls', False))
+        smtp_ssl_verify = bool(configuration.get('smtp_ssl_verify', True))
+        ca_bundle = configuration.get('ca_bundle')
+
+        # DKIM configuration (optional)
+        dkim_config = None
+        if configuration.get('dkim_private_key_path') and configuration.get('dkim_selector') and configuration.get('dkim_domain'):
+            dkim_config = {
+                'dkim_private_key_path': configuration.get('dkim_private_key_path'),
+                'dkim_selector': configuration.get('dkim_selector'),
+                'dkim_domain': configuration.get('dkim_domain'),
+                'dkim_headers': configuration.get('dkim_headers'),
+            }
+
         # Create email message
         email_message = create_email_message(configuration)
 
@@ -460,6 +488,13 @@ def main():
             password=configuration.get('smtp_password'),
             timeout=timeout,
             dry_run=dry_run,
+            auth_method=auth_method,
+            oauth2_provider=oauth2_provider,
+            oauth2=oauth2,
+            require_tls=require_tls,
+            smtp_ssl_verify=smtp_ssl_verify,
+            ca_bundle=ca_bundle,
+            dkim_config=dkim_config,
         )
 
         if send_success:
