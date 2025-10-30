@@ -13,12 +13,25 @@ A Python script for sending emails via SMTP with support for HTML formatting, pl
 
 ## Requirements
 
-- Python 3.6 or higher
-- No external packages required (uses standard library only)
+- Python 3.8 or higher
+- Optional: `dkimpy` for DKIM signing
+- Uses standard library for OAuth2 token refresh (no extra deps required)
 
 ## Configuration
 
 All email settings are stored in `email_config.json`. Edit this file to configure your email:
+
+### Security and authentication options
+
+- `auth_method`: "basic" | "oauth2"
+- `oauth2_provider`: "gmail" | "office365"
+- Gmail OAuth2 fields: `client_id`, `client_secret`, `refresh_token`, `token_uri`
+- Office365 OAuth2 fields: `tenant_id`, `client_id`, `client_secret`, `refresh_token`
+- TLS controls:
+  - `use_ssl` (implicit SMTPS), `use_tls` (STARTTLS), `require_tls` (fail if no STARTTLS)
+  - `smtp_ssl_verify` (default true) and optional `ca_bundle` path
+- DKIM signing (optional):
+  - `dkim_private_key_path` (PEM), `dkim_selector`, `dkim_domain`, `dkim_headers` (list)
 
 ```json
 {
@@ -38,6 +51,31 @@ All email settings are stored in `email_config.json`. Edit this file to configur
   ]
 }
 ```
+
+#### Example: Gmail with OAuth2, STARTTLS, and DKIM
+
+```json
+{
+  "smtp_server": "smtp.gmail.com",
+  "use_tls": true,
+  "require_tls": true,
+  "auth_method": "oauth2",
+  "oauth2_provider": "gmail",
+  "client_id": "...",
+  "client_secret": "...",
+  "refresh_token": "...",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "from_address": "you@gmail.com",
+  "to_addresses": ["user@example.com"],
+  "subject": "Test",
+  "body_text": "Hello",
+  "dkim_private_key_path": "./dkim_private.pem",
+  "dkim_selector": "s1",
+  "dkim_domain": "example.com"
+}
+```
+
+For Office365, the token endpoint is derived from `tenant_id` as `https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token` with scope `https://outlook.office365.com/.default`.
 
 ### Configuration Fields
 

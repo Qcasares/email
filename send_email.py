@@ -12,6 +12,12 @@ import sys
 import ssl
 import logging
 import mimetypes
+import base64
+from typing import Optional, Tuple, List
+from email import policy
+from email.utils import formatdate, make_msgid
+import urllib.request
+import urllib.parse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -106,6 +112,111 @@ def validate_configuration(configuration):
         return False
 
     return True
+
+
+def _build_ssl_context(verify: bool, ca_bundle: Optional[str] = None) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if not verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    if verify and ca_bundle:
+        try:
+            context.load_verify_locations(cafile=ca_bundle)
+        except Exception as err:
+            logging.warning("Failed to load CA bundle '%s': %s", ca_bundle, err)
+    return context
+
+
+def _fetch_oauth2_token(provider: str, config: dict) -> str:
+    """
+    Obtain an OAuth2 access token via refresh token flow for Gmail or Office365.
+
+    Expected config keys:
+      - Gmail: token_uri, client_id, client_secret, refresh_token
+      - Office365: tenant_id, client_id, client_secret, refresh_token
+    """
+    provider = str(provider or '').lower()
+    if provider == 'gmail':
+        token_uri = config.get('token_uri', 'https://oauth2.googleapis.com/token')
+        data = {
+            'client_id': config.get('client_id'),
+            'client_secret': config.get('client_secret'),
+            'refresh_token': config.get('refresh_token'),
+            'grant_type': 'refresh_token',
+        }
+    elif provider == 'office365' or provider == 'microsoft' or provider == 'azure' or provider == 'office':
+        tenant_id = config.get('tenant_id', 'common')
+        token_uri = f'https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token'
+        data = {
+            'client_id': config.get('client_id'),
+            'client_secret': config.get('client_secret'),
+            'refresh_token': config.get('refresh_token'),
+            'grant_type': 'refresh_token',
+            'scope': 'https://outlook.office365.com/.default',
+        }
+    else:
+        raise ValueError("Unsupported oauth2_provider. Use 'gmail' or 'office365'.")
+
+    for key, val in data.items():
+        if not val and key not in {'scope'}:
+            raise ValueError(f"Missing OAuth2 config value: {key}")
+
+    encoded = urllib.parse.urlencode(data).encode('utf-8')
+    req = urllib.request.Request(token_uri, data=encoded, method='POST')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+    try:
+        with urllib.request.urlopen(req, timeout=int(config.get('timeout', 15))) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+            access_token = payload.get('access_token')
+            if not access_token:
+                raise RuntimeError('No access_token in token response')
+            return access_token
+    except Exception as err:
+        logging.error('OAuth2 token fetch failed: %s', err)
+        raise
+
+
+def _smtp_auth_xoauth2(smtp, email_address: str, access_token: str) -> None:
+    auth_string = f"user={email_address}\x01auth=Bearer {access_token}\x01\x01".encode('utf-8')
+    b64 = base64.b64encode(auth_string).decode('ascii')
+    code, response = smtp.docmd('AUTH', 'XOAUTH2 ' + b64)
+    if code != 235:
+        raise smtplib.SMTPAuthenticationError(code, response)
+
+
+def _ensure_core_headers(email_message) -> None:
+    if 'Date' not in email_message:
+        email_message['Date'] = formatdate(localtime=True)
+    if 'Message-ID' not in email_message:
+        email_message['Message-ID'] = make_msgid()
+
+
+def _maybe_dkim_sign(msg_bytes: bytes, config: dict) -> bytes:
+    key_path = config.get('dkim_private_key_path')
+    selector = config.get('dkim_selector')
+    domain = config.get('dkim_domain')
+    if not (key_path and selector and domain):
+        return msg_bytes
+    try:
+        import dkim  # type: ignore
+    except Exception:
+        logging.error("dkimpy not installed but DKIM config provided.")
+        raise
+    try:
+        with open(key_path, 'rb') as f:
+            privkey = f.read()
+        headers = config.get('dkim_headers') or ['from', 'to', 'subject', 'date', 'message-id', 'mime-version', 'content-type']
+        sig = dkim.sign(
+            msg_bytes,
+            selector=str(selector).encode('ascii'),
+            domain=str(domain).encode('ascii'),
+            privkey=privkey,
+            include_headers=[h.encode('ascii') for h in headers],
+        )
+        return sig + msg_bytes
+    except Exception as err:
+        logging.error('DKIM signing failed: %s', err)
+        raise
     return True
 
 
@@ -201,7 +312,10 @@ def attach_files(email_message, attachment_file_paths):
 
 
 def send_email(smtp_server_address, smtp_server_port, email_message, from_address, to_addresses, *,
-               use_ssl=False, use_tls=False, username=None, password=None, timeout=10, dry_run=False):
+               use_ssl=False, use_tls=False, username=None, password=None, timeout=10, dry_run=False,
+               auth_method: Optional[str]=None, oauth2_provider: Optional[str]=None, oauth2: Optional[dict]=None,
+               require_tls: bool=False, smtp_ssl_verify: bool=True, ca_bundle: Optional[str]=None,
+               dkim_config: Optional[dict]=None):
     """
     Send email via SMTP server.
 
@@ -223,23 +337,42 @@ def send_email(smtp_server_address, smtp_server_port, email_message, from_addres
         logging.info("Connecting to SMTP server %s:%s...", smtp_server_address, smtp_server_port)
 
         if use_ssl:
-            context = ssl.create_default_context()
+            context = _build_ssl_context(smtp_ssl_verify, ca_bundle)
             smtp_connection = smtplib.SMTP_SSL(smtp_server_address, smtp_server_port, timeout=timeout, context=context)
         else:
             smtp_connection = smtplib.SMTP(smtp_server_address, smtp_server_port, timeout=timeout)
         smtp_connection.ehlo()
 
         if use_tls and not use_ssl:
-            context = ssl.create_default_context()
-            smtp_connection.starttls(context=context)
-            smtp_connection.ehlo()
+            if require_tls and not smtp_connection.has_extn('starttls'):
+                raise smtplib.SMTPException('Server does not support STARTTLS but require_tls is set')
+            context = _build_ssl_context(smtp_ssl_verify, ca_bundle)
+            if smtp_connection.has_extn('starttls'):
+                smtp_connection.starttls(context=context)
+                smtp_connection.ehlo()
+            elif require_tls:
+                raise smtplib.SMTPException('STARTTLS was required but not initiated')
 
-        if username and password:
+        # Authentication
+        method = (auth_method or '').lower()
+        if method == 'oauth2' and oauth2_provider:
+            email_addr = from_address
+            access_token = _fetch_oauth2_token(oauth2_provider, oauth2 or {})
+            _smtp_auth_xoauth2(smtp_connection, email_addr, access_token)
+        elif username and password:
             logging.debug("Authenticating as %s", username)
             smtp_connection.login(username, password)
 
+        # Ensure core headers and generate bytes under SMTP policy
+        _ensure_core_headers(email_message)
+        msg_bytes = email_message.as_bytes(policy=policy.SMTP)
+
+        # DKIM sign if configured
+        if dkim_config:
+            msg_bytes = _maybe_dkim_sign(msg_bytes, dkim_config)
+
         logging.info("Sending email...")
-        smtp_connection.sendmail(from_address, to_addresses, email_message.as_string())
+        smtp_connection.sendmail(from_address, to_addresses, msg_bytes)
 
         smtp_connection.quit()
         logging.info("Email sent successfully!")
@@ -270,13 +403,16 @@ def main():
         config_file_path = sys.argv[1]
 
     try:
+        # Configure default logging BEFORE loading config so early errors are visible
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
         # Load and validate configuration
         configuration = load_configuration(config_file_path)
 
-        # Configure logging
+        # Adjust log level based on config without reinitializing handlers
         log_level_str = str(configuration.get('log_level', 'INFO')).upper()
         log_level = getattr(logging, log_level_str, logging.INFO)
-        logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
+        logging.getLogger().setLevel(log_level)
 
         if not validate_configuration(configuration):
             sys.exit(1)
